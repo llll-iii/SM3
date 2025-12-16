@@ -1,0 +1,327 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdint.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <assert.h>
+
+// -------------------------- 1. 宏定义与常量（SM3标准规定） --------------------------
+#define SM3_HASH_SIZE 32          // 哈希结果长度（256bit=32字节）
+#define SM3_BLOCK_SIZE 64         // 分组长度（512bit=64字节）
+#define SM3_WORD_NUM 68           // 分组扩展后W数组长度
+#define SM3_W_DASH_NUM 64         // 分组扩展后W'数组长度
+#define SM3_ITERATION_ROUNDS 64   // 压缩函数轮迭代次数
+
+// 循环左移运算
+#define ROTL32(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+// 压缩函数常量（T_j）
+#define T1 0x79cc4519  // 第1-16轮
+#define T2 0x7a879d8a  // 第17-64轮
+
+// 置换函数P0、P1（标准定义）
+#define P0(x) ((x) ^ ROTL32((x), 9) ^ ROTL32((x), 17))
+#define P1(x) ((x) ^ ROTL32((x), 15) ^ ROTL32((x), 23))
+
+// 布尔函数FF（分轮实现）
+#define FF1(X, Y, Z) ((X) ^ (Y) ^ (Z))                    // 第1-16轮
+#define FF2(X, Y, Z) (((X) & (Y)) | ((X) & (Z)) | ((Y) & (Z))) // 第17-64轮
+
+// 布尔函数GG（分轮实现）
+#define GG1(X, Y, Z) ((X) ^ (Y) ^ (Z))                    // 第1-16轮
+#define GG2(X, Y, Z) (((X) & (Y)) | ((~(X)) & (Z)))       // 第17-64轮
+
+// SM3标准初始向量IV（十六进制，大端序）
+static const uint32_t SM3_IV[8] = {
+    0x7380166f, 0x4914b2b9, 0x172442d7, 0xda8a0600,
+    0xa96f30bc, 0x163138aa, 0xe38dee4d, 0xb0fb0e4e
+};
+
+// -------------------------- 2. 结构体定义 --------------------------
+// SM3上下文结构体（存储中间计算状态）
+typedef struct {
+    uint32_t iv[8];               // 初始向量/中间结果（8个32bit字）
+    uint8_t block[SM3_BLOCK_SIZE];// 当前未处理的分组数据
+    size_t block_len;             // 当前分组已填充的字节数
+    uint64_t total_len;           // 消息总长度（单位：bit）
+} SM3_CTX;
+
+// -------------------------- 3. 静态辅助函数（内部使用） --------------------------
+// 字节序转换：小端字节数组转32bit大端字（适配x86架构）
+static uint32_t bytes_to_uint32(const uint8_t* bytes) {
+    return (uint32_t)bytes[0] << 24 |
+        (uint32_t)bytes[1] << 16 |
+        (uint32_t)bytes[2] << 8 |
+        (uint32_t)bytes[3];
+}
+
+// 32bit大端字转小端字节数组（用于最终哈希值输出）
+static void uint32_to_bytes(uint32_t word, uint8_t* bytes) {
+    bytes[0] = (uint8_t)(word >> 24);
+    bytes[1] = (uint8_t)(word >> 16);
+    bytes[2] = (uint8_t)(word >> 8);
+    bytes[3] = (uint8_t)word;
+}
+
+// 对单个512bit分组进行压缩计算（SM3核心）
+static void sm3_compress(SM3_CTX* ctx) {
+    uint32_t W[SM3_WORD_NUM] = { 0 };    // 扩展后W数组（68个32bit字）
+    uint32_t W_dash[SM3_W_DASH_NUM] = { 0 }; // 扩展后W'数组（64个32bit字）
+    uint32_t A, B, C, D, E, F, G, H;  // 压缩中间变量
+    uint32_t SS1, SS2, TT1, TT2;      // 轮迭代临时变量
+    int i;
+
+    // 步骤1：分组扩展（生成W和W'数组）
+    for (i = 0; i < 16; i++) {
+        W[i] = bytes_to_uint32(&ctx->block[i * 4]);
+    }
+    for (i = 16; i < SM3_WORD_NUM; i++) {
+        W[i] = P1(W[i - 16] ^ W[i - 9] ^ ROTL32(W[i - 3], 15))
+            ^ ROTL32(W[i - 13], 7) ^ W[i - 6];
+    }
+    for (i = 0; i < SM3_W_DASH_NUM; i++) {
+        W_dash[i] = W[i] ^ W[i + 4];
+    }
+
+    // 步骤2：初始化压缩变量
+    A = ctx->iv[0];
+    B = ctx->iv[1];
+    C = ctx->iv[2];
+    D = ctx->iv[3];
+    E = ctx->iv[4];
+    F = ctx->iv[5];
+    G = ctx->iv[6];
+    H = ctx->iv[7];
+
+    // 步骤3：64轮迭代计算
+    for (i = 0; i < SM3_ITERATION_ROUNDS; i++) {
+        SS1 = ROTL32((ROTL32(A, 12) + E + ROTL32((i < 16) ? T1 : T2, i)), 7);
+        SS2 = SS1 ^ ROTL32(A, 12);
+
+        if (i < 16) {
+            TT1 = FF1(A, B, C) + D + SS2 + W_dash[i];
+            TT2 = GG1(E, F, G) + H + SS1 + W[i];
+        }
+        else {
+            TT1 = FF2(A, B, C) + D + SS2 + W_dash[i];
+            TT2 = GG2(E, F, G) + H + SS1 + W[i];
+        }
+
+        // 更新压缩变量
+        D = C;
+        C = ROTL32(B, 9);
+        B = A;
+        A = TT1;
+        H = G;
+        G = ROTL32(F, 19);
+        F = E;
+        E = P0(TT2);
+    }
+
+    // 步骤4：更新上下文IV
+    ctx->iv[0] ^= A;
+    ctx->iv[1] ^= B;
+    ctx->iv[2] ^= C;
+    ctx->iv[3] ^= D;
+    ctx->iv[4] ^= E;
+    ctx->iv[5] ^= F;
+    ctx->iv[6] ^= G;
+    ctx->iv[7] ^= H;
+}
+
+// -------------------------- 4. SM3核心接口函数 --------------------------
+// 初始化SM3上下文
+void sm3_init(SM3_CTX* ctx) {
+    assert(ctx != NULL);
+    memcpy(ctx->iv, SM3_IV, sizeof(SM3_IV));
+    memset(ctx->block, 0, SM3_BLOCK_SIZE);
+    ctx->block_len = 0;
+    ctx->total_len = 0;
+}
+
+// 处理消息数据（支持分多次调用）
+void sm3_update(SM3_CTX* ctx, const uint8_t* data, size_t data_len) {
+    assert(ctx != NULL && (data != NULL || data_len == 0));
+    if (data_len == 0) return;
+
+    ctx->total_len += (uint64_t)data_len * 8;
+
+    // 处理当前分组剩余空间
+    if (ctx->block_len > 0) {
+        size_t fill_len = SM3_BLOCK_SIZE - ctx->block_len;
+        if (data_len <= fill_len) {
+            memcpy(&ctx->block[ctx->block_len], data, data_len);
+            ctx->block_len += data_len;
+            return;
+        }
+        else {
+            memcpy(&ctx->block[ctx->block_len], data, fill_len);
+            sm3_compress(ctx);
+            data += fill_len;
+            data_len -= fill_len;
+            ctx->block_len = 0;
+        }
+    }
+
+    // 批量处理完整分组
+    while (data_len >= SM3_BLOCK_SIZE) {
+        memcpy(ctx->block, data, SM3_BLOCK_SIZE);
+        sm3_compress(ctx);
+        data += SM3_BLOCK_SIZE;
+        data_len -= SM3_BLOCK_SIZE;
+    }
+
+    // 保存剩余数据
+    if (data_len > 0) {
+        memcpy(ctx->block, data, data_len);
+        ctx->block_len = data_len;
+    }
+}
+
+// 完成哈希计算，输出结果
+void sm3_final(SM3_CTX* ctx, uint8_t* hash) {
+    assert(ctx != NULL && hash != NULL);
+
+    // 消息填充（标准流程）
+    ctx->block[ctx->block_len++] = 0x80; // 填充1个"1"bit
+
+    // 若剩余空间不足8字节，需新增分组
+    if (ctx->block_len > SM3_BLOCK_SIZE - 8) {
+        memset(&ctx->block[ctx->block_len], 0, SM3_BLOCK_SIZE - ctx->block_len);
+        sm3_compress(ctx);
+        memset(ctx->block, 0, SM3_BLOCK_SIZE);
+        ctx->block_len = 0;
+    }
+
+    // 填充0字节，预留8字节存长度
+    memset(&ctx->block[ctx->block_len], 0, SM3_BLOCK_SIZE - ctx->block_len - 8);
+
+    // 存储消息总长度（64bit大端序）
+    uint32_to_bytes((uint32_t)(ctx->total_len >> 32), &ctx->block[SM3_BLOCK_SIZE - 8]);
+    uint32_to_bytes((uint32_t)ctx->total_len, &ctx->block[SM3_BLOCK_SIZE - 4]);
+
+    // 压缩最后一个分组
+    sm3_compress(ctx);
+
+    // 输出哈希结果（IV转字节数组）
+    for (int i = 0; i < 8; i++) {
+        uint32_to_bytes(ctx->iv[i], &hash[i * 4]);
+    }
+
+    // 清空上下文（安全考虑）
+    memset(ctx, 0, sizeof(SM3_CTX));
+}
+
+// 一站式哈希计算（简化接口，适用于内存数据）
+void sm3_hash(const uint8_t* data, size_t data_len, uint8_t* hash) {
+    SM3_CTX ctx;
+    sm3_init(&ctx);
+    sm3_update(&ctx, data, data_len);
+    sm3_final(&ctx, hash);
+}
+
+// 文件哈希计算（支持任意大小文件）
+void sm3_file_hash(const char* filename, uint8_t* hash, int* success) {
+    assert(filename != NULL && hash != NULL && success != NULL);
+    *success = 0;
+
+    FILE* fp = fopen(filename, "rb");
+    if (fp == NULL) {
+        fprintf(stderr, "错误：无法打开文件 '%s'\n", filename);
+        return;
+    }
+
+    SM3_CTX ctx;
+    sm3_init(&ctx);
+    uint8_t buffer[4096]; // 4KB缓冲区
+    size_t read_len;
+
+    // 分块读取文件
+    while ((read_len = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        sm3_update(&ctx, buffer, read_len);
+    }
+
+    // 检查读取错误
+    if (ferror(fp)) {
+        fprintf(stderr, "错误：读取文件 '%s' 失败\n", filename);
+        fclose(fp);
+        return;
+    }
+
+    sm3_final(&ctx, hash);
+    fclose(fp);
+    *success = 1;
+}
+
+// -------------------------- 5. 工具函数（命令行支持） --------------------------
+// 打印哈希值（64位十六进制字符串）
+void sm3_print_hash(const uint8_t* hash) {
+    assert(hash != NULL);
+    for (int i = 0; i < SM3_HASH_SIZE; i++) {
+        printf("%02x", hash[i]);
+    }
+    printf("\n");
+}
+
+// 解析命令行参数（-s 字符串 / -f 文件）
+int sm3_parse_args(int argc, char* argv[], char** input_str, char** input_file) {
+    assert(input_str != NULL && input_file != NULL);
+    *input_str = NULL;
+    *input_file = NULL;
+
+    // 检查参数数量
+    if (argc != 3) {
+        fprintf(stderr, "用法错误！正确格式：\n");
+        fprintf(stderr, "  字符串哈希：%s -s \"输入字符串\"\n", argv[0]);
+        fprintf(stderr, "  文件哈希：%s -f 文件名\n", argv[0]);
+        return 0;
+    }
+
+    // 解析参数类型
+    if (strcmp(argv[1], "-s") == 0) {
+        *input_str = argv[2];
+    }
+    else if (strcmp(argv[1], "-f") == 0) {
+        *input_file = argv[2];
+    }
+    else {
+        fprintf(stderr, "参数错误！仅支持 -s（字符串） 和 -f（文件）\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+// -------------------------- 6. 主函数（命令行工具入口） --------------------------
+int main(int argc, char* argv[]) {
+    uint8_t hash[SM3_HASH_SIZE];
+    char* input_str = NULL;
+    char* input_file = NULL;
+    int success;
+
+    // 解析参数
+    if (!sm3_parse_args(argc, argv, &input_str, &input_file)) {
+        return 1;
+    }
+
+    // 处理字符串输入
+    if (input_str != NULL) {
+        sm3_hash((uint8_t*)input_str, strlen(input_str), hash);
+        printf("SM3哈希值（字符串）：");
+        sm3_print_hash(hash);
+    }
+    // 处理文件输入
+    else if (input_file != NULL) {
+        sm3_file_hash(input_file, hash, &success);
+        if (success) {
+            printf("SM3哈希值（文件：%s）：", input_file);
+            sm3_print_hash(hash);
+        }
+        else {
+            return 1;
+        }
+    }
+
+    return 0;
+}
